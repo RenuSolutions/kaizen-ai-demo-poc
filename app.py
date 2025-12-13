@@ -69,7 +69,6 @@ def create_docx_bytes(title: str, body: str) -> bytes:
     doc = Document()
     doc.add_heading(title, level=1)
 
-    # Light formatting: treat lines starting with '-' or '•' as bullet-ish
     for line in body.split("\n"):
         line = line.rstrip()
         if not line.strip():
@@ -81,9 +80,69 @@ def create_docx_bytes(title: str, body: str) -> bytes:
     return buf.getvalue()
 
 
+# -----------------------------
+# AI generation (UPDATED)
+# -----------------------------
 def generate_doc(doc_name: str, instruction: str, slide_text: str) -> str:
-    """Call OpenAI and return generated text."""
-    prompt = f"""
+    """
+    Generate document text using OpenAI.
+    Executive Summary follows the PPC one-page template exactly.
+    """
+
+    if doc_name == "Executive Summary":
+        prompt = f"""
+You are an internal PPC Partners strategy and operations consultant.
+
+Your task is to generate a **ONE-PAGE EXECUTIVE SUMMARY**
+for PPC Partners executive leadership (ELT).
+
+This document must be:
+- Executive-ready
+- Communication-ready
+- Suitable for sharing without edits
+- Written in a professional, business tone
+- Concise, structured, and outcome-focused
+- NOT written like an AI report
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORMAT — FOLLOW EXACTLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TITLE:
+Executive Summary – Preboarding Kaizen (One Page)
+
+SECTION 1: Overview
+Write a concise paragraph (3–4 sentences) explaining:
+- What the Kaizen focused on
+- Why it was undertaken
+- The overall objective and outcome
+
+SECTION 2: Key Challenges Identified
+Bullet points only.
+
+SECTION 3: Future-State Improvements
+Bullet points only.
+
+SECTION 4: Organizational Benefits
+Bullet points only.
+
+SECTION 5: Implementation Plan
+- 0–30 Days:
+- 30–90 Days:
+- 6–12 Months:
+
+SECTION 6: Summary
+One short reinforcing paragraph.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SOURCE CONTENT (DO NOT INVENT FACTS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{slide_text}
+""".strip()
+
+    else:
+        prompt = f"""
 You are an expert in Lean, Kaizen, and enterprise change management.
 
 Write: {doc_name}
@@ -98,7 +157,6 @@ Kaizen Slide Content:
 {slide_text}
 """.strip()
 
-    # Use the newer Responses API (recommended)
     resp = client.responses.create(
         model="gpt-4o-mini",
         input=prompt,
@@ -110,13 +168,13 @@ Kaizen Slide Content:
 # Document catalog
 # -----------------------------
 DOCS: List[Tuple[str, str]] = [
-    ("Executive Summary", "One page max. Audience: ELT. Include: problem, root cause, solution, impact, asks/decisions."),
+    ("Executive Summary", "One page max. Audience: ELT."),
     ("Leader Talking Points", "One page max. Bullet-point talking points for a leader to present the Kaizen."),
     ("Change Management Summary", "Impacted roles, training needs, comms plan, adoption risks, mitigations."),
-    ("Kaizen Wins & Benefits", "Benefits realization summary. Quantified wins if present; otherwise mark TBD + data needed."),
+    ("Kaizen Wins & Benefits", "Benefits realization summary. Quantified wins if present; otherwise mark TBD."),
     ("30/60/90 Day Follow-Up", "30/60/90 checkpoints with owners, due dates (relative), measures, and risks."),
     ("Sustainment & Control Plan", "Controls, KPIs, cadence, auditing approach, ownership, escalation path."),
-    ("Recognition Message", "A recognition/celebration message template (email/Teams post) for contributors."),
+    ("Recognition Message", "A recognition/celebration message template (email/Teams post)."),
 ]
 
 
@@ -135,7 +193,6 @@ st.success("Deck uploaded successfully.")
 with st.spinner("Extracting slide content..."):
     slide_text_full = extract_slide_text(pptx_bytes)
 
-# Cost control for large decks
 st.subheader("Cost Controls")
 max_chars = st.slider(
     "Max characters of slide text sent to AI (controls cost)",
@@ -153,8 +210,7 @@ with colA:
 
 with colB:
     st.warning(
-        "This demo generates **ONE document at a time** to control cost and avoid quota issues.\n\n"
-        "If you hit `insufficient_quota`, enable billing or increase your usage limits on the OpenAI platform."
+        "This demo generates **ONE document at a time** to control cost and avoid quota issues."
     )
 
 st.divider()
@@ -181,19 +237,13 @@ if st.button("Generate Selected Document"):
         st.write(result_text)
 
     except AuthenticationError:
-        st.error(
-            "OpenAI authentication failed. Confirm your `OPENAI_API_KEY` in Streamlit Secrets is correct "
-            "and that you revoked any previously exposed keys."
-        )
+        st.error("OpenAI authentication failed. Check your API key.")
     except RateLimitError:
-        st.error(
-            "OpenAI quota/rate limit hit (insufficient_quota or too many requests). "
-            "Check billing/usage limits on platform.openai.com, then try again."
-        )
+        st.error("OpenAI quota/rate limit hit. Check billing and usage limits.")
     except APIConnectionError:
-        st.error("Network/API connection error. Try again; if it persists, your network may be blocking outbound calls.")
+        st.error("Network/API connection error.")
     except APIStatusError as e:
-        st.error(f"OpenAI API returned an error: {e}")
+        st.error(f"OpenAI API error: {e}")
     except Exception as e:
         st.error(f"Unexpected error: {e}")
 
