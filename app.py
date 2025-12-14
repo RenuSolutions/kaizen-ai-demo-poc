@@ -156,7 +156,7 @@ KAIZEN SLIDE CONTENT:
   resp = client.responses.create(
     model="gpt-4o-mini",
     input=prompt
-)
+    )
 text = resp.output_text
 
 
