@@ -153,11 +153,12 @@ KAIZEN SLIDE CONTENT:
 {slide_text}
 """.strip()
 
-    resp = client.responses.create(
-        model="gpt-4o-mini",
-        input=prompt,
-        response_format={"type": "json"},
-    )
+  resp = client.responses.create(
+    model="gpt-4o-mini",
+    input=prompt
+)
+text = resp.output_text
+
 
     return resp.output_parsed
 
