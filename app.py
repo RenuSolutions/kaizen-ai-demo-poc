@@ -1,34 +1,17 @@
 import io
-import json
-import base64
+import unicodedata
 from io import BytesIO
-from typing import List, Tuple, Dict, Any
 
 import streamlit as st
 from pptx import Presentation
 from docx import Document
-from docx.oxml import OxmlElement
-from docx.text.paragraph import Paragraph
-
 from openai import OpenAI
 from openai import AuthenticationError, RateLimitError, APIConnectionError, APIStatusError
 
 
 # ============================================================
-# PPC EXECUTIVE SUMMARY TEMPLATE (EMBEDDED)
-# DO NOT MODIFY — this is your uploaded Word document
+# Page configuration
 # ============================================================
-PPC_EXEC_SUMMARY_TEMPLATE_B64 = """
-UEsDBBQAAAAIAK9s0lT4xYJ8gAEAAHkFAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbK2Uy27CMBBF9/2K
-hVt0K5NqEJjYpEo0qZ0i0BKKC0lF6C9sQHk3v+fZrR4Gk4Q8c+f0c8w9c5g0Fh9xq2bW8Y3x4nqz1F
-... (FULL BASE64 STRING CONTINUES — KEEP AS IS) ...
-UEsFBgAAAAAqACoA3gwAAH8xAAAAAA==
-""".strip()
-
-
-# -----------------------------
-# Page config
-# -----------------------------
 st.set_page_config(
     page_title="Kaizen AI – Executive Summary Generator",
     layout="wide",
@@ -36,19 +19,20 @@ st.set_page_config(
 
 st.title("Kaizen Deck → Executive Summary (Communication-Ready)")
 st.caption(
-    "Upload a Kaizen report-out PPTX and generate a PPC-formatted, executive-ready "
-    "one-page summary using the approved Word template."
+    "Upload a Kaizen report-out PPTX and generate a PPC-formatted, "
+    "executive-ready one-page summary using the approved Word template."
 )
 
 
-# -----------------------------
+# ============================================================
 # Secrets / OpenAI client
-# -----------------------------
+# ============================================================
 api_key = st.secrets.get("OPENAI_API_KEY", "").strip()
 if not api_key:
     st.error(
         "Missing OPENAI_API_KEY.\n\n"
-        "Add it in Streamlit → Settings → Secrets:\n"
+        "Add it in Streamlit:\n"
+        "Manage app → Settings → Secrets\n\n"
         'OPENAI_API_KEY="sk-..."'
     )
     st.stop()
@@ -56,208 +40,228 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 
 
-# -----------------------------
-# PPTX text extraction
-# -----------------------------
+# ============================================================
+# Utilities
+# ============================================================
+def normalize_text(text: str) -> str:
+    """
+    Remove smart quotes, bullets, em-dashes, and other non-ASCII characters
+    that break python-docx XML, while preserving readability.
+    """
+    return (
+        unicodedata.normalize("NFKD", text)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+
+
 def extract_slide_text(pptx_bytes: bytes) -> str:
+    """Extract readable text from all PPT slides."""
     prs = Presentation(io.BytesIO(pptx_bytes))
-    out = []
+    slides_out = []
+
     for i, slide in enumerate(prs.slides, start=1):
         parts = []
         for shape in slide.shapes:
             if hasattr(shape, "text") and shape.text:
-                t = shape.text.strip()
-                if t:
-                    parts.append(t)
+                txt = shape.text.strip()
+                if txt:
+                    parts.append(txt)
         if parts:
-            out.append(f"Slide {i}:\n" + "\n".join(parts))
-    return "\n\n".join(out)
+            slides_out.append(f"Slide {i}:\n" + "\n".join(parts))
+
+    return "\n\n".join(slides_out)
 
 
-def truncate_text(text: str, max_chars: int) -> str:
-    return text if len(text) <= max_chars else text[:max_chars]
-
-
-# -----------------------------
-# Word helpers (template injection)
-# -----------------------------
-def load_template() -> Document:
-    raw = base64.b64decode(PPC_EXEC_SUMMARY_TEMPLATE_B64)
-    return Document(BytesIO(raw))
-
-
-def iter_paragraphs(doc: Document):
-    return list(doc.paragraphs)
-
-
-def delete_paragraph(p: Paragraph):
-    p._element.getparent().remove(p._element)
-
-
-def insert_after(p: Paragraph, text: str, style):
-    new_p = OxmlElement("w:p")
-    p._element.addnext(new_p)
-    para = Paragraph(new_p, p._parent)
-    para.style = style
-    para.add_run(text)
-    return para
-
-
-def find_heading_index(paragraphs, heading):
-    for i, p in enumerate(paragraphs):
-        if p.text.strip() == heading:
-            return i
-    return -1
-
-
-def replace_block(doc, start, end, lines):
-    paras = iter_paragraphs(doc)
-    s = find_heading_index(paras, start)
-    e = find_heading_index(paras, end)
-
-    if s == -1 or e == -1 or e <= s:
-        return
-
-    block = paras[s+1:e]
-    style = block[0].style if block else paras[s].style
-
-    for p in block:
-        delete_paragraph(p)
-
-    paras = iter_paragraphs(doc)
-    anchor = paras[s]
-
-    last = anchor
-    for line in lines:
-        last = insert_after(last, line, style)
-
-
-def replace_single(doc, start, end, text):
-    paras = iter_paragraphs(doc)
-    s = find_heading_index(paras, start)
-    e = find_heading_index(paras, end)
-
-    if s == -1:
-        return
-
-    block = paras[s+1:e] if e != -1 else paras[s+1:]
-    style = block[0].style if block else paras[s].style
-
-    for p in block:
-        delete_paragraph(p)
-
-    paras = iter_paragraphs(doc)
-    insert_after(paras[s], text, style)
-
-
-def set_title(doc, title):
+# ============================================================
+# Word template helpers
+# ============================================================
+def replace_single(doc: Document, start_heading: str, end_heading: str, content: str):
+    """
+    Replace text between two headings with a paragraph block.
+    """
+    recording = False
     for p in doc.paragraphs:
-        if p.text.startswith("Executive Summary"):
-            p.text = title
-            return
+        if start_heading in p.text:
+            recording = True
+            continue
+        if end_heading in p.text:
+            break
+        if recording:
+            p.text = ""
+
+    for p in doc.paragraphs:
+        if start_heading in p.text:
+            idx = doc.paragraphs.index(p)
+            doc.paragraphs[idx + 1].add_run(content)
+            break
 
 
-def build_exec_summary(deck_name: str, content: Dict[str, Any]) -> bytes:
-    doc = load_template()
+def replace_block(doc: Document, start_heading: str, end_heading: str, bullets: list[str]):
+    """
+    Replace text between headings with bullet points.
+    """
+    recording = False
+    for p in doc.paragraphs:
+        if start_heading in p.text:
+            recording = True
+            continue
+        if end_heading in p.text:
+            break
+        if recording:
+            p.text = ""
 
-    set_title(doc, f"Executive Summary – {deck_name} (One Page)")
+    for p in doc.paragraphs:
+        if start_heading in p.text:
+            idx = doc.paragraphs.index(p)
+            insert_at = idx + 1
+            for b in bullets:
+                doc.paragraphs[insert_at].add_run(b)
+                insert_at += 1
+            break
 
-    replace_single(doc, "Overview", "Key Challenges Identified", content["overview"])
+
+# ============================================================
+# AI Generation (STRICT PPC FORMAT)
+# ============================================================
+def generate_exec_summary(slide_text: str) -> dict:
+    """
+    Generate content EXACTLY aligned to the PPC Executive Summary template.
+    """
+
+    prompt = f"""
+You are preparing a FINAL, EXECUTIVE-READY, ONE-PAGE document.
+
+STRICT RULES:
+- Follow the section structure EXACTLY as defined below
+- Use concise, professional, executive language
+- NO emojis, NO markdown symbols, NO headings outside the template
+- Bullet points must be short and factual
+- Do not invent metrics; mark missing data as TBD
+
+SECTIONS TO RETURN (JSON ONLY):
+- overview (paragraph)
+- challenges (list of bullets)
+- improvements (list of bullets)
+- benefits (list of bullets)
+- plan_0_30 (list of bullets)
+- plan_30_90 (list of bullets)
+- plan_6_12 (list of bullets)
+- summary (paragraph)
+
+KAIZEN SLIDE CONTENT:
+{slide_text}
+""".strip()
+
+    resp = client.responses.create(
+        model="gpt-4o-mini",
+        input=prompt,
+        response_format={"type": "json"},
+    )
+
+    return resp.output_parsed
+
+
+# ============================================================
+# Build Word document from PPC template
+# ============================================================
+def build_exec_summary_doc(template_bytes: bytes, content: dict) -> bytes:
+    doc = Document(BytesIO(template_bytes))
+
+    replace_single(
+        doc,
+        "Overview",
+        "Key Challenges Identified",
+        normalize_text(content["overview"]),
+    )
 
     replace_block(
         doc,
         "Key Challenges Identified",
         "Future-State Improvements",
-        content["challenges"],
+        [normalize_text(x) for x in content["challenges"]],
     )
 
     replace_block(
         doc,
         "Future-State Improvements",
         "Organizational Benefits",
-        content["improvements"],
+        [normalize_text(x) for x in content["improvements"]],
     )
 
     replace_block(
         doc,
         "Organizational Benefits",
         "Implementation Plan",
-        content["benefits"],
+        [normalize_text(x) for x in content["benefits"]],
     )
 
     replace_block(
         doc,
         "Implementation Plan",
         "Summary",
-        [
-            f"0–30 Days: {content['plan_0_30']}",
-            f"30–90 Days: {content['plan_30_90']}",
-            f"6–12 Months: {content['plan_6_12']}",
-        ],
+        (
+            [normalize_text(x) for x in content["plan_0_30"]]
+            + [normalize_text(x) for x in content["plan_30_90"]]
+            + [normalize_text(x) for x in content["plan_6_12"]]
+        ),
     )
 
-    replace_single(doc, "Summary", "", content["summary"])
-
-    buf = BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-
-# -----------------------------
-# AI generation (structured)
-# -----------------------------
-def generate_structured_summary(slide_text: str) -> Dict[str, Any]:
-    prompt = f"""
-Return ONLY valid JSON with these keys:
-overview, challenges, improvements, benefits,
-plan_0_30, plan_30_90, plan_6_12, summary
-
-Rules:
-- challenges / improvements / benefits are arrays of short bullets (no hyphens)
-- Do NOT invent metrics; use "TBD" if missing
-- No extra text outside JSON
-
-KAIZEN CONTENT:
-{slide_text}
-""".strip()
-
-    r = client.responses.create(
-        model="gpt-4o-mini",
-        input=prompt,
+    replace_single(
+        doc,
+        "Summary",
+        None,
+        normalize_text(content["summary"]),
     )
 
-    txt = r.output_text.strip()
-    return json.loads(txt[txt.find("{"): txt.rfind("}")+1])
+    out = BytesIO()
+    doc.save(out)
+    return out.getvalue()
 
 
-# -----------------------------
+# ============================================================
 # UI
-# -----------------------------
+# ============================================================
 pptx_file = st.file_uploader("Upload Kaizen Report-Out Deck (PPTX)", type=["pptx"])
-if not pptx_file:
+template_file = st.file_uploader(
+    "Upload PPC Executive Summary Word Template (.docx)",
+    type=["docx"],
+)
+
+if not pptx_file or not template_file:
+    st.info("Upload both the PPTX and the approved Word template to continue.")
     st.stop()
 
 pptx_bytes = pptx_file.read()
-slide_text = truncate_text(extract_slide_text(pptx_bytes), 20000)
+template_bytes = template_file.read()
 
-deck_name = pptx_file.name.replace(".pptx", "")
+st.success("Files uploaded successfully.")
+
+with st.spinner("Extracting slide content..."):
+    slide_text = extract_slide_text(pptx_bytes)
 
 if st.button("Generate Executive Summary"):
     try:
-        with st.spinner("Generating executive-ready document…"):
-            structured = generate_structured_summary(slide_text)
-            docx = build_exec_summary(deck_name, structured)
+        with st.spinner("Generating executive summary using PPC template..."):
+            content = generate_exec_summary(slide_text)
+            doc_bytes = build_exec_summary_doc(template_bytes, content)
 
-        st.success("Executive Summary ready")
+        st.success("Executive Summary generated successfully.")
 
         st.download_button(
-            "Download Executive Summary.docx",
-            data=docx,
-            file_name="Executive Summary.docx",
+            "Download Executive Summary (Word)",
+            data=doc_bytes,
+            file_name="Executive_Summary_PPC.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
 
+    except AuthenticationError:
+        st.error("OpenAI authentication failed. Check your API key.")
+    except RateLimitError:
+        st.error("OpenAI quota exceeded. Check billing or usage limits.")
+    except APIConnectionError:
+        st.error("Network error connecting to OpenAI.")
+    except APIStatusError as e:
+        st.error(f"OpenAI API error: {e}")
     except Exception as e:
-        st.error(str(e))
-
-
+        st.error(f"Unexpected error: {e}")
