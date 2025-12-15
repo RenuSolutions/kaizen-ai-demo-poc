@@ -1,14 +1,14 @@
 import io
+import json
 import re
 from io import BytesIO
-from typing import Dict, List
+from typing import Dict, List, Any
 
 import streamlit as st
 from pptx import Presentation
 
 from docx import Document
 from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
 
 from openai import OpenAI
 from openai import AuthenticationError, RateLimitError, APIConnectionError, APIStatusError
@@ -47,7 +47,6 @@ client = OpenAI(api_key=api_key)
 # Helpers
 # -----------------------------
 def extract_slide_text(pptx_bytes: bytes) -> str:
-    """Extract plain text from all slides."""
     prs = Presentation(io.BytesIO(pptx_bytes))
     out = []
     for i, slide in enumerate(prs.slides, start=1):
@@ -71,12 +70,11 @@ def truncate_text(text: str, max_chars: int) -> str:
 def _insert_paragraph_after(paragraph, text: str = "", style: str = None):
     """
     Insert a new paragraph AFTER 'paragraph' (python-docx doesn't provide insert_paragraph_after).
-    Returns the new paragraph.
     """
     new_p = OxmlElement("w:p")
     paragraph._p.addnext(new_p)
+
     new_para = paragraph._parent.add_paragraph()
-    # Move the newly created paragraph element into the right spot
     new_para._p = new_p
 
     if style:
@@ -95,63 +93,60 @@ def _clean_bullets(lines: List[str]) -> List[str]:
     cleaned = []
     for ln in lines:
         ln = ln.strip()
-        ln = re.sub(r"^[-•\u2022]\s*", "", ln)  # strip leading bullets
+        ln = re.sub(r"^[-•\u2022]\s*", "", ln)
         if ln:
             cleaned.append(ln)
     return cleaned
 
 
-def _parse_sections(ai_text: str) -> Dict[str, str]:
+def _normalize_sections(data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Expect AI to return tagged sections:
-    [OVERVIEW]...[/OVERVIEW]
-    [CHALLENGES]...[/CHALLENGES]
-    etc.
+    Ensure keys exist and types are correct.
     """
-    tags = ["OVERVIEW", "CHALLENGES", "IMPROVEMENTS", "BENEFITS", "PLAN", "SUMMARY"]
-    out = {}
-    for t in tags:
-        m = re.search(rf"\[{t}\](.*?)\[/\s*{t}\]", ai_text, flags=re.DOTALL | re.IGNORECASE)
-        out[t] = (m.group(1).strip() if m else "").strip()
-    return out
+    def as_str(x):
+        return (x or "").strip()
+
+    def as_list(x):
+        if x is None:
+            return []
+        if isinstance(x, list):
+            return [str(i).strip() for i in x if str(i).strip()]
+        # if model gave a single string with lines
+        if isinstance(x, str):
+            return [s.strip() for s in x.splitlines() if s.strip()]
+        return [str(x).strip()] if str(x).strip() else []
+
+    return {
+        "overview": as_str(data.get("overview")),
+        "challenges": as_list(data.get("challenges")),
+        "improvements": as_list(data.get("improvements")),
+        "benefits": as_list(data.get("benefits")),
+        "plan": as_list(data.get("plan")),
+        "summary": as_str(data.get("summary")),
+        "title": as_str(data.get("title")),  # optional
+    }
 
 
-def generate_exec_summary_sections(slide_text: str) -> Dict[str, str]:
+def generate_exec_summary_json(slide_text: str) -> (Dict[str, Any], str):
     """
-    Generate content for the PPC one-page template using strict tags so we can place content reliably.
+    Generate content as STRICT JSON. Returns (sections_dict, raw_output_text).
     """
     prompt = f"""
 You are writing a PPC Partners executive one-page Kaizen summary.
-You MUST output ONLY these six tagged sections, in this exact order, with no extra text:
 
-[OVERVIEW]
-2–3 sentences. No bullets.
-[/OVERVIEW]
-
-[CHALLENGES]
-3–6 bullets max. Each bullet on its own line. No numbering.
-[/CHALLENGES]
-
-[IMPROVEMENTS]
-3–6 bullets max. Each bullet on its own line. No numbering.
-[/IMPROVEMENTS]
-
-[BENEFITS]
-3–6 bullets max. Each bullet on its own line. No numbering.
-[/BENEFITS]
-
-[PLAN]
-3 bullets max. Each bullet on its own line. Use time horizons like 0–30, 30–90, 6–12 months if possible.
-[/PLAN]
-
-[SUMMARY]
-1–2 sentences. No bullets.
-[/SUMMARY]
+Return ONLY valid JSON (no markdown, no backticks). The JSON MUST have exactly these keys:
+- "title" (string)  -> example: "Executive Summary – <Kaizen Name> (One Page)"
+- "overview" (string) -> 2–3 sentences. No bullets.
+- "challenges" (array of strings) -> 3–6 bullets max
+- "improvements" (array of strings) -> 3–6 bullets max
+- "benefits" (array of strings) -> 3–6 bullets max
+- "plan" (array of strings) -> 2–3 bullets max (use time horizons like 0–30, 30–90, 6–12 months if possible)
+- "summary" (string) -> 1–2 sentences. No bullets.
 
 Rules:
-- Use only facts supported by the slide content; if something is missing, write "TBD" briefly.
+- Use only facts supported by the slide content; if missing, use "TBD" briefly.
 - Keep it concise and executive-ready.
-- Do not add any other headings or commentary.
+- Do not include any other keys or commentary.
 
 Kaizen slide content:
 {slide_text}
@@ -161,11 +156,22 @@ Kaizen slide content:
         model="gpt-4o-mini",
         input=prompt,
     )
-    sections = _parse_sections(resp.output_text)
-    return sections
+    raw = resp.output_text.strip()
+
+    # Try strict JSON parse
+    try:
+        data = json.loads(raw)
+        return _normalize_sections(data), raw
+    except Exception:
+        # common recovery: sometimes the model adds leading text; try to extract the first {...}
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if m:
+            data = json.loads(m.group(0))
+            return _normalize_sections(data), raw
+        raise ValueError("AI did not return valid JSON.")
 
 
-def fill_docx_template(template_bytes: bytes, sections: Dict[str, str]) -> bytes:
+def fill_docx_template(template_bytes: bytes, sections: Dict[str, Any]) -> bytes:
     """
     Replace placeholders in the template with content.
     Placeholders must be on their own line:
@@ -174,15 +180,15 @@ def fill_docx_template(template_bytes: bytes, sections: Dict[str, str]) -> bytes
     doc = Document(BytesIO(template_bytes))
 
     placeholders = {
-        "{{OVERVIEW}}": "OVERVIEW",
-        "{{CHALLENGES}}": "CHALLENGES",
-        "{{IMPROVEMENTS}}": "IMPROVEMENTS",
-        "{{BENEFITS}}": "BENEFITS",
-        "{{PLAN}}": "PLAN",
-        "{{SUMMARY}}": "SUMMARY",
+        "{{OVERVIEW}}": "overview",
+        "{{CHALLENGES}}": "challenges",
+        "{{IMPROVEMENTS}}": "improvements",
+        "{{BENEFITS}}": "benefits",
+        "{{PLAN}}": "plan",
+        "{{SUMMARY}}": "summary",
     }
 
-    # Validate placeholders exist somewhere (paragraphs)
+    # Validate placeholders exist
     all_text = "\n".join([p.text.strip() for p in doc.paragraphs])
     missing = [ph for ph in placeholders.keys() if ph not in all_text]
     if missing:
@@ -194,36 +200,31 @@ def fill_docx_template(template_bytes: bytes, sections: Dict[str, str]) -> bytes
     for p in list(doc.paragraphs):
         key = p.text.strip()
         if key in placeholders:
-            section_name = placeholders[key]
-            content = sections.get(section_name, "").strip()
+            field = placeholders[key]
+            p.text = ""  # remove placeholder
 
-            # Clear the placeholder paragraph text
-            p.text = ""
-
-            if section_name in ("OVERVIEW", "SUMMARY"):
-                # Single paragraph (no bullets)
-                if not content:
-                    content = "TBD"
-                p.add_run(content)
+            if field in ("overview", "summary"):
+                text = sections.get(field, "").strip() or "TBD"
+                p.add_run(text)
 
             else:
-                # Bullet list section
-                lines = _clean_bullets(content.splitlines())
-                if not lines:
-                    lines = ["TBD"]
+                items = sections.get(field, [])
+                if not items:
+                    items = ["TBD"]
 
-                # Put first bullet in the same paragraph (so we don’t leave blank space)
+                items = _clean_bullets(items)
+
+                # first bullet goes in same paragraph
                 try:
                     p.style = "List Bullet"
                 except Exception:
                     pass
-                p.add_run(lines[0])
+                p.add_run(items[0])
 
-                # Remaining bullets inserted after
                 prev = p
-                for ln in lines[1:]:
+                for item in items[1:]:
                     newp = _insert_paragraph_after(prev, "", style="List Bullet")
-                    newp.add_run(ln)
+                    newp.add_run(item)
                     prev = newp
 
     buf = BytesIO()
@@ -252,7 +253,6 @@ template_bytes = template_file.read()
 
 st.success("Files uploaded successfully.")
 
-# Cost control
 st.subheader("Cost Controls")
 max_chars = st.slider(
     "Max characters of slide text sent to the model",
@@ -262,9 +262,10 @@ max_chars = st.slider(
     step=5_000,
 )
 
+slide_text_full = extract_slide_text(pptx_bytes)
+slide_text = truncate_text(slide_text_full, max_chars=max_chars)
+
 with st.expander("Preview extracted slide text (truncated)"):
-    slide_text_full = extract_slide_text(pptx_bytes)
-    slide_text = truncate_text(slide_text_full, max_chars=max_chars)
     st.text(slide_text[:12000])
 
 st.divider()
@@ -272,9 +273,10 @@ st.divider()
 if st.button("Generate Executive Summary"):
     try:
         with st.spinner("Generating summary content..."):
-            slide_text_full = extract_slide_text(pptx_bytes)
-            slide_text = truncate_text(slide_text_full, max_chars=max_chars)
-            sections = generate_exec_summary_sections(slide_text)
+            sections, raw_ai = generate_exec_summary_json(slide_text)
+
+        with st.expander("Show raw AI output (debug)"):
+            st.text(raw_ai)
 
         with st.spinner("Filling Word template..."):
             output_docx = fill_docx_template(template_bytes, sections)
@@ -289,12 +291,7 @@ if st.button("Generate Executive Summary"):
         )
 
         st.subheader("Preview (what was inserted)")
-        st.write({"OVERVIEW": sections["OVERVIEW"]})
-        st.write({"CHALLENGES": sections["CHALLENGES"]})
-        st.write({"IMPROVEMENTS": sections["IMPROVEMENTS"]})
-        st.write({"BENEFITS": sections["BENEFITS"]})
-        st.write({"PLAN": sections["PLAN"]})
-        st.write({"SUMMARY": sections["SUMMARY"]})
+        st.write(sections)
 
     except ValueError as ve:
         st.error(str(ve))
@@ -308,5 +305,6 @@ if st.button("Generate Executive Summary"):
         st.error(f"OpenAI API returned an error: {e}")
     except Exception as e:
         st.error(f"Unexpected error: {e}")
+
 
 
